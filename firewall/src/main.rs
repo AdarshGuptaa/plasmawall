@@ -11,6 +11,8 @@ use std::net::Ipv4Addr;
 use firewall_common::PacketLog;
 
 const PIN_DIR: &str = "/sys/fs/bpf/plasmawall";
+const PERSIST_DIR: &str = "/etc/plasmawall";
+const BLOCKLIST_FILE: &str = "/etc/plasmawall/blocklist.txt";
 
 #[derive(Debug, Parser)]
 #[clap(name = "plasma", about = "PlasmaWall — Linux eBPF Firewall")]
@@ -100,6 +102,23 @@ async fn start(iface: String) -> anyhow::Result<()> {
     let events = ebpf.take_map("EVENTS").unwrap();
     events.pin(format!("{}/EVENTS", PIN_DIR))?;
 
+    // State Rehydration: Restore blocked IPs from persistence
+    if let Ok(ips) = load_persistent_ips() {
+        if !ips.is_empty() {
+            let map_data = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR))?;
+            let map = Map::from_map_data(map_data)?;
+            let mut blocklist: HashMap<MapData, u32, u8> = HashMap::try_from(map)?;
+            
+            for ip in &ips {
+                let key = u32::from(*ip).to_be();
+                if let Err(e) = blocklist.insert(&key, &1u8, 0) {
+                    eprintln!("Failed to rehydrate IP {}: {}", ip, e);
+                }
+            }
+            println!("  Restored {} blocked IPs from persistence", ips.len());
+        }
+    }
+
     println!("[SUCCESS] Firewall ACTIVATED on {}", iface);
     Ok(())
 }
@@ -168,52 +187,92 @@ async fn status() -> anyhow::Result<()> {
 // ─── Block / Unblock / List ─────────────────────────────
 
 async fn block_ip(ip: Ipv4Addr) -> anyhow::Result<()> {
-    let map_data = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR))
-        .context("Firewall is not running. Start it first with: sudo plasma start")?;
-    let map = Map::from_map_data(map_data)?;
-    let mut blocklist: HashMap<MapData, u32, u8> = HashMap::try_from(map)?;
+    // Try to inject into the live kernel map if active
+    if let Ok(map_data) = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR)) {
+        if let Ok(map) = Map::from_map_data(map_data) {
+            if let Ok(mut blocklist) = HashMap::<MapData, u32, u8>::try_from(map) {
+                let key = u32::from(ip).to_be();
+                let _ = blocklist.insert(&key, &1u8, 0);
+            }
+        }
+    }
 
-    let key = u32::from(ip).to_be();
-    blocklist.insert(&key, &1u8, 0)?;
+    // Always persist to the saved file
+    let mut ips = load_persistent_ips().unwrap_or_default();
+    if !ips.contains(&ip) {
+        ips.push(ip);
+        save_persistent_ips(&ips)?;
+        println!("[BLOCKED] {} (Saved permanently)", ip);
+    } else {
+        println!("[BLOCKED] {} (Already in list)", ip);
+    }
 
-    println!("[BLOCKED] {}", ip);
     Ok(())
 }
 
 async fn unblock_ip(ip: Ipv4Addr) -> anyhow::Result<()> {
-    let map_data = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR))
-        .context("Firewall is not running. Start it first with: sudo plasma start")?;
-    let map = Map::from_map_data(map_data)?;
-    let mut blocklist: HashMap<MapData, u32, u8> = HashMap::try_from(map)?;
+    // Try to remove from the live kernel map if active
+    if let Ok(map_data) = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR)) {
+        if let Ok(map) = Map::from_map_data(map_data) {
+            if let Ok(mut blocklist) = HashMap::<MapData, u32, u8>::try_from(map) {
+                let key = u32::from(ip).to_be();
+                let _ = blocklist.remove(&key);
+            }
+        }
+    }
 
-    let key = u32::from(ip).to_be();
-    blocklist.remove(&key)?;
+    // Always update persistent file
+    let mut ips = load_persistent_ips().unwrap_or_default();
+    if ips.contains(&ip) {
+        ips.retain(|x| x != &ip);
+        save_persistent_ips(&ips)?;
+        println!("[UNBLOCKED] {} (Removed permanently)", ip);
+    } else {
+        println!("[UNBLOCKED] {} (Not found in list)", ip);
+    }
 
-    println!("[UNBLOCKED] {}", ip);
     Ok(())
 }
 
 async fn list_blocked() -> anyhow::Result<()> {
-    let map_data = MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR))
-        .context("Firewall is not running. Start it first with: sudo plasma start")?;
-    let map = Map::from_map_data(map_data)?;
-    let blocklist: HashMap<MapData, u32, u8> = HashMap::try_from(map)?;
+    match MapData::from_pin(format!("{}/BLOCKLIST", PIN_DIR)) {
+        Ok(map_data) => {
+            // Firewall is ACTIVE - read from real-time kernel memory
+            let map = Map::from_map_data(map_data)?;
+            let blocklist: HashMap<MapData, u32, u8> = HashMap::try_from(map)?;
 
-    let mut count = 0;
-    println!("Blocked IPs:");
-    for item in blocklist.iter() {
-        if let Ok((key, _)) = item {
-            let ip = Ipv4Addr::from(u32::from_be(key));
-            println!("  - {}", ip);
-            count += 1;
+            let mut count = 0;
+            println!("Blocked IPs (Active in Kernel):");
+            for item in blocklist.iter() {
+                if let Ok((key, _)) = item {
+                    let ip = Ipv4Addr::from(u32::from_be(key));
+                    println!("  - {}", ip);
+                    count += 1;
+                }
+            }
+
+            if count == 0 {
+                println!("  (none)");
+            }
+
+            println!("\nTotal: {} active blocked", count);
+        }
+        Err(_) => {
+            // Firewall is INACTIVE - read directly from persistent disk state
+            let ips = load_persistent_ips().unwrap_or_default();
+            
+            if ips.is_empty() {
+                println!("Firewall is INACTIVE. Saved Blocklist is empty.");
+            } else {
+                println!("Firewall is INACTIVE. Saved Blocked IPs:");
+                for ip in &ips {
+                    println!("  - {}", ip);
+                }
+                println!("\nTotal: {} saved (will automatically activate on 'start')", ips.len());
+            }
         }
     }
 
-    if count == 0 {
-        println!("  (none)");
-    }
-
-    println!("\nTotal: {} blocked", count);
     Ok(())
 }
 
@@ -272,5 +331,28 @@ async fn log_events() -> anyhow::Result<()> {
     let ctrl_c = signal::ctrl_c();
     ctrl_c.await?;
     println!("Detached log viewer.");
+    Ok(())
+}
+
+// ─── Persistence Helpers ──────────────────────────────
+
+fn load_persistent_ips() -> anyhow::Result<Vec<Ipv4Addr>> {
+    if !std::path::Path::new(BLOCKLIST_FILE).exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(BLOCKLIST_FILE)?;
+    let ips = content.lines()
+        .filter_map(|s| s.trim().parse::<Ipv4Addr>().ok())
+        .collect();
+    Ok(ips)
+}
+
+fn save_persistent_ips(ips: &[Ipv4Addr]) -> anyhow::Result<()> {
+    std::fs::create_dir_all(PERSIST_DIR)?;
+    let content = ips.iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(BLOCKLIST_FILE, content)?;
     Ok(())
 }
